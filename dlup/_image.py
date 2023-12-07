@@ -191,7 +191,11 @@ class SlideImage:
             )
 
         check_if_mpp_is_valid(*self._wsi.spacing)
-        self._avg_native_mpp = (float(self._wsi.spacing[0]) + float(self._wsi.spacing[1])) / 2
+        # self._avg_native_mpp = (float(self._wsi.spacing[0]) + float(self._wsi.spacing[1])) / 2
+
+        self._apply_color_profile = apply_color_profile
+        self.__color_transforms = None
+
 
     def close(self) -> None:
         """Close the underlying image."""
@@ -338,11 +342,7 @@ class SlideImage:
         size = np.asarray(size)
         level_size = np.array(self.get_scaled_size(scaling))
 
-        if (size < 0).any():
-            raise ValueError("Size values must be greater than zero.")
-
-        if ((location < 0) | ((location + size) > level_size)).any():
-            raise ValueError("Requested region is outside level boundaries.")
+        _check_size_and_location(location, size, level_size)
 
         native_level = wsi.get_best_level_for_downsample(1 / scaling)
         native_level_size = wsi.level_dimensions[native_level]
@@ -430,7 +430,9 @@ class SlideImage:
 
     def get_mpp(self, scaling: float) -> float:
         """Returns the respective mpp from the scaling."""
-        return self._avg_native_mpp / scaling
+        if self._wsi.spacing is None:
+            return 1.0
+        return self._wsi.spacing[0] / scaling
 
     def get_scaling(self, mpp: float | None) -> float:
         """Inverse of get_mpp()."""
