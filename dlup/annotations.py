@@ -16,7 +16,11 @@ Assumed:
 - The type of object (point, box, polygon) is fixed per label.
 - The mpp is fixed per label.
 
-Also the ASAP XML data format is supported.
+Supported file formats:
+- ASAP XML
+- Darwin V7 JSON
+- GeoJSON
+- HaloXML
 """
 from __future__ import annotations
 
@@ -55,6 +59,16 @@ class AnnotationType(Enum):
 
 
 class AnnotationSorting(Enum):
+    """The ways to sort the annotations. This is used in the constructors of the `WsiAnnotations` class, and applied
+    to the output of `WsiAnnotations.read_region()`.
+
+    - REVERSE: Sort the output in reverse order.
+    - BY_AREA: Often when the annotation tools do not properly support hierarchical order, one would annotate in a way
+        that the smaller objects are on top of the larger objects. This option sorts the output by area, so that the
+        larger objects appear first in the output and then the smaller objects.
+    - NONE: Do not apply any sorting and output as is presented in the input file.
+    """
+
     REVERSE = "reverse"
     BY_AREA = "by_area"
     NONE = "none"
@@ -227,6 +241,35 @@ _POSTPROCESSORS: dict[AnnotationType, Callable[[Polygon | Point, Polygon], Polyg
 }
 
 
+def _geometry_to_geojson(geometry: Polygon | Point, label: str) -> dict[str, Any]:
+    """Function to convert a geometry to a GeoJSON object.
+
+    Parameters
+    ----------
+    geometry : Polygon | Point
+        A polygon or point object
+    label : str
+        The label name
+
+    Returns
+    -------
+    dict[str, Any]
+        Output dictionary representing the data in GeoJSON
+
+    """
+    data = {
+        "type": "Feature",
+        "properties": {
+            "classification": {
+                "name": label,
+                "color": None,
+            },
+        },
+        "geometry": shapely.geometry.mapping(geometry),
+    }
+    return data
+
+
 class SingleAnnotationWrapper:
     """Class to hold the annotations of one specific label (class) for a whole slide image"""
 
@@ -284,19 +327,7 @@ class SingleAnnotationWrapper:
         -------
         dict
         """
-        data = [
-            {
-                "type": "Feature",
-                "properties": {
-                    "classification": {
-                        "name": _.label,
-                        "color": None,
-                    },
-                },
-                "geometry": shapely.geometry.mapping(_),
-            }
-            for _ in self._annotation
-        ]
+        data = [_geometry_to_geojson(_, label=_.label) for _ in self._annotation]
         return data
 
     @staticmethod
@@ -342,7 +373,21 @@ class WsiAnnotations:
         self,
         annotations: list[SingleAnnotationWrapper],
         sorting: AnnotationSorting = AnnotationSorting.NONE,
+        offset_to_slide_bounds: bool = False,
     ):
+        """
+        Parameters
+        ----------
+        annotations : list[SingleAnnotationWrapper]
+            A list of annotations for a single label.
+        sorting : AnnotationSorting
+            How to sort the annotations returned from the `read_region()` function.
+        offset_to_slide_bounds : bool
+            If true, will set the property `offset_to_slide_bounds` to True. This means that the annotations need
+            to be offset to the slide bounds. This is useful when the annotations are read from a file format which
+            requires this, for instance HaloXML.
+        """
+
         self.available_labels = sorted(
             [_.annotation_class for _ in annotations],
             key=lambda annotation_class: (
@@ -357,6 +402,19 @@ class WsiAnnotations:
         self._annotation_trees = {a_cls: self[a_cls].as_strtree() for a_cls in self.available_labels}
 
         self._sorting = sorting
+        self._offset_to_slide_bounds = offset_to_slide_bounds
+
+    @property
+    def offset_to_slide_bounds(self) -> bool:
+        """
+        If True, the annotations need to be offset to the slide bounds. This is useful when the annotations are read
+        from a file format which requires this, for instance HaloXML.
+
+        Returns
+        -------
+        bool
+        """
+        return self._offset_to_slide_bounds
 
     def filter(self, labels: str | list[str] | tuple[str]) -> None:
         """
@@ -447,6 +505,7 @@ class WsiAnnotations:
         cls: Type[_TWsiAnnotations],
         geojsons: PathLike | Iterable[PathLike],
         scaling: float | None = None,
+        sorting: AnnotationSorting = AnnotationSorting.BY_AREA,
     ) -> _TWsiAnnotations:
         """
         Constructs an WsiAnnotations object from geojson.
@@ -458,6 +517,9 @@ class WsiAnnotations:
             object.
         scaling : float, optional
             The scaling to apply to the annotations.
+        sorting: AnnotationSorting
+            The sorting to apply to the annotations. Check the `AnnotationSorting` enum for more information.
+            By default, the annotations are sorted by area.
 
         Returns
         -------
@@ -488,13 +550,14 @@ class WsiAnnotations:
             SingleAnnotationWrapper(a_cls=data[k][0].annotation_class, annotation=data[k]) for k in data.keys()
         ]
 
-        return cls(_annotations)
+        return cls(_annotations, sorting=sorting)
 
     @classmethod
     def from_asap_xml(
         cls,
         asap_xml: PathLike,
         scaling: float | None = None,
+        sorting: AnnotationSorting = AnnotationSorting.BY_AREA,
     ) -> WsiAnnotations:
         """
         Read annotations as an ASAP [1] XML file. ASAP is a tool for viewing and annotating whole slide images.
@@ -504,6 +567,9 @@ class WsiAnnotations:
         asap_xml : PathLike
             Path to ASAP XML annotation file.
         scaling : float, optional
+        sorting: AnnotationSorting
+            The sorting to apply to the annotations. Check the `AnnotationSorting` enum for more information.
+            By default, the annotations are sorted by area.
 
         References
         ----------
@@ -575,10 +641,12 @@ class WsiAnnotations:
 
                     opened_annotations += 1
 
-        return cls(list(annotations.values()), sorting=AnnotationSorting.BY_AREA)
+        return cls(list(annotations.values()), sorting=sorting)
 
     @classmethod
-    def from_halo_xml(cls, halo_xml: PathLike, scaling: float | None = None) -> WsiAnnotations:
+    def from_halo_xml(
+        cls, halo_xml: PathLike, scaling: float | None = None, sorting: AnnotationSorting = AnnotationSorting.NONE
+    ) -> WsiAnnotations:
         """
         Read annotations as a Halo [1] XML file.
         This function requires `pyhaloxml` [2] to be installed.
@@ -589,6 +657,9 @@ class WsiAnnotations:
             Path to the Halo XML file.
         scaling : float, optional
             The scaling to apply to the annotations.
+        sorting: AnnotationSorting
+            The sorting to apply to the annotations. Check the `AnnotationSorting` enum for more information. By default
+            the annotations are not sorted as HALO supports hierarchical annotations.
 
         References
         ----------
@@ -622,10 +693,34 @@ class WsiAnnotations:
                 )
             )
 
-        return cls(annotations, sorting=AnnotationSorting.NONE)
+        return cls(annotations, sorting=sorting, offset_to_slide_bounds=True)
 
     @classmethod
-    def from_darwin_json(cls, darwin_json: PathLike, scaling: float | None = None) -> WsiAnnotations:
+    def from_darwin_json(
+        cls, darwin_json: PathLike, scaling: float | None = None, sorting: AnnotationSorting = AnnotationSorting.NONE
+    ) -> WsiAnnotations:
+        """
+        Read annotations as a V7 Darwin [1] JSON file.
+
+        Parameters
+        ----------
+        darwin_json : PathLike
+            Path to the Darwin JSON file.
+        scaling : float, optional
+            The scaling to apply to the annotations.
+        sorting: AnnotationSorting
+            The sorting to apply to the annotations. Check the `AnnotationSorting` enum for more information.
+            By default, the annotations are not sorted as V7 Darwin supports hierarchical annotations.
+
+        References
+        ----------
+        .. [1] https://darwin.v7labs.com/
+
+        Returns
+        -------
+        WsiAnnotations
+
+        """
         if not DARWIN_SDK_AVAILABLE:
             raise RuntimeError("`darwin` is not available. Install using `python -m pip install darwin-py`.")
         import darwin
@@ -673,46 +768,58 @@ class WsiAnnotations:
         output = []
         for an_cls, _annotation in all_annotations.items():
             output.append(SingleAnnotationWrapper(a_cls=an_cls, annotation=_annotation))
-        return cls(output, sorting=AnnotationSorting.NONE)
+        return cls(output, sorting=sorting)
 
     def __getitem__(self, a_cls: AnnotationClass) -> SingleAnnotationWrapper:
         return self._annotations[a_cls]
 
-    def as_geojson(self, split_per_label: bool = False) -> GeoJsonDict | list[tuple[str, GeoJsonDict]]:
+    def as_geojson(self) -> GeoJsonDict:
         """
-        Output the annotations as proper geojson.
-
-        Parameters
-        ----------
-        split_per_label : bool
-            If set will return a list of a tuple with str, GeoJSON dict for this specific label.
+        Output the annotations as proper geojson. These outputs are sorted according to the `AnnotationSorting` selected
+        for the annotations. This ensures the annotations are correctly sorted in the output.
 
         Returns
         -------
         list of (str, GeoJsonDict)
         """
-        jsons = [(label, self[label].as_json()) for label in self.available_labels]
-        if split_per_label:
-            per_label_jsons = []
-            for label, json_per_label in jsons:
-                per_label_data: GeoJsonDict = {
-                    "type": "FeatureCollection",
-                    "features": [],
-                    "id": None,
-                }
-                for idx, json_dict in enumerate(json_per_label):
-                    per_label_data["features"].append(json_dict)
-                    per_label_data["id"] = str(idx)
-                per_label_jsons.append((label, per_label_data))
-            return per_label_jsons
+        coordinates, size = self.bounding_box
+        region_size = (coordinates[0] + size[0], coordinates[1] + size[1])
+        all_annotations = self.read_region((0, 0), 1.0, region_size)
+
+        # We should group annotations that belong to the same class
+        grouped_annotations = []
+        previous_label = None
+        group = []
+        for annotation in all_annotations:
+            label = annotation.label
+            if not previous_label:
+                previous_label = label
+
+            if previous_label == label:
+                group.append(annotation)
+            else:
+                grouped_annotations.append(group)
+                group = [annotation]
+                previous_label = label
+        # After the loop, add the last group if it's not empty
+        if group:
+            grouped_annotations.append(group)
 
         data: GeoJsonDict = {"type": "FeatureCollection", "features": [], "id": None}
-        index = 0
-        for label, json_per_label in jsons:
-            for json_dict in json_per_label:
-                json_dict["id"] = str(index)
-                data["features"].append(json_dict)
-                index += 1
+        for idx, annotation_list in enumerate(grouped_annotations):
+            label = annotation_list[0].label
+            if len(annotation_list) == 1:
+                json_dict = _geometry_to_geojson(annotation_list[0], label=label)
+            else:
+                if annotation_list[0].type in [AnnotationType.BOX, AnnotationType.POLYGON]:
+                    annotation = shapely.geometry.MultiPolygon(annotation_list)
+                else:
+                    annotation = shapely.geometry.MultiPoint(annotation_list)
+                json_dict = _geometry_to_geojson(annotation, label=label)
+
+            json_dict["id"] = str(idx)
+            data["features"].append(json_dict)
+
         return data
 
     def simplify(self, tolerance: float, *, preserve_topology: bool = True) -> None:
@@ -736,9 +843,9 @@ class WsiAnnotations:
 
     def read_region(
         self,
-        coordinates: npt.NDArray[np.int_ | np.float_] | tuple[GenericNumber, GenericNumber],
+        location: npt.NDArray[np.int_ | np.float_] | tuple[GenericNumber, GenericNumber],
         scaling: float,
-        region_size: npt.NDArray[np.int_ | np.float_] | tuple[GenericNumber, GenericNumber],
+        size: npt.NDArray[np.int_ | np.float_] | tuple[GenericNumber, GenericNumber],
     ) -> list[Polygon | Point]:
         """Reads the region of the annotations. API is the same as `dlup.SlideImage` so they can be used in conjunction.
 
@@ -757,8 +864,8 @@ class WsiAnnotations:
 
         Parameters
         ----------
-        coordinates: np.ndarray or tuple
-        region_size : np.ndarray or tuple
+        location: np.ndarray or tuple
+        size : np.ndarray or tuple
         scaling : float
 
         Returns
@@ -778,12 +885,12 @@ class WsiAnnotations:
         >>> wsi = wsi.get_scaled_view(scaling=0.5)
         >>> wsi = wsi.read_region(location=(0,0), size=wsi.size)
         >>> annotations = WsiAnnotations.from_geojson([Path("path/to/geojson.json")], labels=["class_name"])
-        >>> polygons: list[Polygons] = annotations.read_region(coordinates=(0,0), region_size=wsi.size, scaling=0.01)
+        >>> polygons: list[Polygons] = annotations.read_region(location=(0,0), size=wsi.size, scaling=0.01)
 
         The polygons can be converted to masks using `dlup.data.transforms.convert_annotations` or
         `dlup.data.transforms.ConvertAnnotationsToMask`.
         """
-        box = list(coordinates) + list(np.asarray(coordinates) + np.asarray(region_size))
+        box = list(location) + list(np.asarray(location) + np.asarray(size))
         box = (np.asarray(box) / scaling).tolist()
         query_box = geometry.box(*box)
 
@@ -828,8 +935,8 @@ class WsiAnnotations:
             0,
             0,
             scaling,
-            -coordinates[0],
-            -coordinates[1],
+            -location[0],
+            -location[1],
         ]
 
         output: list[Polygon | Point] = []

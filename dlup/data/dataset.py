@@ -19,7 +19,7 @@ import PIL
 from numpy.typing import NDArray
 
 from dlup import BoundaryMode, SlideImage
-from dlup.annotations import WsiAnnotations
+from dlup.annotations import Point, Polygon, WsiAnnotations
 from dlup.background import is_foreground
 from dlup.experimental_backends import ImageBackend  # type: ignore
 from dlup.tiling import Grid, GridOrder, TilingMode
@@ -27,6 +27,8 @@ from dlup.tools import ConcatSequences, MapSequence
 from dlup.types import ROIType
 
 MaskTypes = Union["SlideImage", npt.NDArray[np.int_], "WsiAnnotations"]
+
+_AnnotationsTypes = Point | Polygon
 
 T_co = TypeVar("T_co", covariant=True)
 T = TypeVar("T")
@@ -42,7 +44,7 @@ class TileSample(TypedDict):
     path: pathlib.Path
     region_index: int
     labels: dict[str, Any] | None
-    annotations: Any | None
+    annotations: Optional[Iterable[_AnnotationsTypes]]
 
 
 PointType = tuple[float, float]
@@ -179,8 +181,10 @@ LRU_CACHE_SIZE = 32
 
 
 @functools.lru_cache(LRU_CACHE_SIZE)
-def _get_cached_slide_image(path: pathlib.Path, backend: ImageBackend, **kwargs: Any) -> "SlideImage":
-    return SlideImage.from_file_path(path, backend=backend, **kwargs)
+def _get_cached_slide_image(
+    path: pathlib.Path, backend: ImageBackend, apply_color_profile: bool, **kwargs: Any
+) -> "SlideImage":
+    return SlideImage.from_file_path(path, backend=backend, apply_color_profile=apply_color_profile, **kwargs)
 
 
 class BaseWsiDataset(Dataset[Union[TileSample, Sequence[TileSample]]]):
@@ -201,9 +205,11 @@ class BaseWsiDataset(Dataset[Union[TileSample, Sequence[TileSample]]]):
         crop: bool = False,
         mask: MaskTypes | None = None,
         mask_threshold: float | None = 0.0,
+        output_tile_size: tuple[int, int] | None = None,
         annotations: list[_AnnotationTypes] | _AnnotationTypes | None = None,
         labels: list[tuple[str, _LabelTypes]] | None = None,
         backend: ImageBackend = ImageBackend.PYVIPS,
+        apply_color_profile: bool = False,
         **kwargs: Any,
     ):
         """
@@ -221,23 +227,33 @@ class BaseWsiDataset(Dataset[Union[TileSample, Sequence[TileSample]]]):
             Threshold to check against. The foreground percentage should be strictly larger than threshold.
             If None anything is foreground. If 1, the region must be completely foreground.
             Other values are in between, for instance if 0.5, the region must be at least 50% foreground.
+        output_tile_size: tuple[int, int], optional
+            If this value is set, this value will be used as the tile size of the output tiles. If this value
+            is different from the underlying grid, this tile will be extracted around the center of the region.
         annotations :
             Annotation classes.
         labels : list
             Image-level labels. Will be added to each individual tile.
         transform :
             Transforming function. To be used for augmentations or other model specific preprocessing.
-        **kwargs :
-            Keyword arguments get passed to the underlying slide image.
+        backend : ImageBackend
+           Backend to pass to SlideImage
+        apply_color_profile : bool
+            Whether to apply the ICC profile to the image if available.
+        **kwargs : Any
+            Passed to SlideImage
         """
         # We need to reuse the pah in order to re-open the image if necessary.
         self._path = path
         self._crop = crop
         self.regions = regions
 
+        self._output_tile_size = output_tile_size
+
         self.annotations = annotations
         self.labels = labels
         self._backend = backend
+        self._apply_color_profile = apply_color_profile
         self._kwargs = kwargs
 
         # Maps from a masked index -> regions index.
@@ -264,7 +280,9 @@ class BaseWsiDataset(Dataset[Union[TileSample, Sequence[TileSample]]]):
     @property
     def slide_image(self) -> "SlideImage":
         """Return the cached slide image instance associated with this dataset."""
-        return _get_cached_slide_image(self.path, self._backend, **self._kwargs)
+        return _get_cached_slide_image(
+            self.path, backend=self._backend, apply_color_profile=self._apply_color_profile, **self._kwargs
+        )
 
     @overload
     def __getitem__(self, index: int) -> TileSample:
@@ -297,6 +315,14 @@ class BaseWsiDataset(Dataset[Union[TileSample, Sequence[TileSample]]]):
         region_view = slide_image.get_scaled_view(scaling)
         region_view.boundary_mode = BoundaryMode.crop if self.crop else BoundaryMode.zero
 
+        if self._output_tile_size is not None:
+            # If we have an output tile_size, we extract a region around the center of the given region.
+            output_tile_x, output_tile_y = self._output_tile_size
+            coordinates_x = x + w / 2 - output_tile_x / 2
+            coordinates_y = y + h / 2 - output_tile_y / 2
+            coordinates = (coordinates_x, coordinates_y)
+            region_size = self._output_tile_size
+
         region = region_view.read_region(coordinates, region_size)
 
         sample: TileSample = {
@@ -313,6 +339,11 @@ class BaseWsiDataset(Dataset[Union[TileSample, Sequence[TileSample]]]):
         if self.annotations is not None:
             if not isinstance(self.annotations, WsiAnnotations):
                 raise NotImplementedError("Only WsiAnnotations are supported at the moment.")
+            _requires_offset = getattr(self.annotations, "offset_to_slide_bounds", False)
+            if _requires_offset:
+                _scaled_offset = slide_image.get_scaled_slide_bounds(scaling)[0]
+                coordinates = (coordinates[0] + _scaled_offset[0], coordinates[1] + _scaled_offset[1])
+
             sample["annotations"] = self.annotations.read_region(coordinates, scaling, region_size)
 
         if self.labels:
@@ -370,10 +401,11 @@ class TiledWsiDataset(BaseWsiDataset):
         crop: bool = False,
         mask: MaskTypes | None = None,
         mask_threshold: float | None = 0.0,
+        output_tile_size: tuple[int, int] | None = None,
         annotations: _AnnotationTypes | None = None,
         labels: list[tuple[str, _LabelTypes]] | None = None,
         transform: Callable[[RegionFromWsiDatasetSample], RegionFromWsiDatasetSample] | None = None,
-        backend: ImageBackend = ImageBackend.PYVIPS,
+        backend: ImageBackend = ImageBackend.OPENSLIDE,
         **kwargs: Any,
     ) -> None:
         self._grids = grids
@@ -390,6 +422,7 @@ class TiledWsiDataset(BaseWsiDataset):
             crop,
             mask=mask,
             mask_threshold=mask_threshold,
+            output_tile_size=output_tile_size,
             annotations=annotations,
             labels=labels,
             backend=backend,
@@ -408,6 +441,7 @@ class TiledWsiDataset(BaseWsiDataset):
         mpp: float | None,
         tile_size: tuple[int, int],
         tile_overlap: tuple[int, int],
+        output_tile_size: tuple[int, int] | None = None,
         tile_mode: TilingMode = TilingMode.overflow,
         grid_order: GridOrder = GridOrder.C,
         crop: bool = False,
@@ -432,6 +466,9 @@ class TiledWsiDataset(BaseWsiDataset):
             Tuple of integers that represent the pixel size of output tiles
         tile_overlap :
             Tuple of integers that represents the overlap of tiles in the x and y direction
+        output_tile_size: tuple[int, int], optional
+            If this value is set, this value will be used as the tile size of the output tiles. If this value
+            is different from the underlying grid, this tile will be extracted around the center of the region.
         tile_mode :
             "skip" or "overflow". see `dlup.tiling.TilingMode` for more information
         grid_order : GridOrder
@@ -456,7 +493,7 @@ class TiledWsiDataset(BaseWsiDataset):
             Backend to use to read the whole slide image.
         limit_bounds : bool
             If the bounds of the grid should be limited to the bounds of the slide given in the `slide_bounds` property
-            of the `SlideImage` class.
+            of the `SlideImage` class. If ROIs are given, this parameter is ignored.
         **kwargs :
             Gets passed to the SlideImage constructor.
 
@@ -474,25 +511,19 @@ class TiledWsiDataset(BaseWsiDataset):
             scaling = slide_image.get_scaling(mpp)
             slide_mpp = slide_image.mpp
 
-            if limit_bounds:
-                if rois is not None:
-                    raise ValueError("Cannot use both `rois` and `limit_bounds` at the same time.")
+            if rois is not None:
+                slide_level_size = slide_image.get_scaled_size(scaling, limit_bounds=False)
+                _rois = parse_rois(rois, slide_level_size, scaling=scaling)
+            elif limit_bounds:
                 if backend == ImageBackend.AUTODETECT or backend == "AUTODETECT":
                     raise ValueError(
                         "Cannot use AutoDetect as backend and use limit_bounds at the same time. "
                         "This is related to issue #151. See https://github.com/NKI-AI/dlup/issues/151"
                     )
-
-                offset, bounds = slide_image.slide_bounds
-                offset = (int(scaling * offset[0]), int(scaling * offset[1]))
-                size = int(bounds[0] * scaling), int(bounds[1] * scaling)
-                _rois = [
-                    (offset, size),
-                ]
-
+                _rois = [slide_image.get_scaled_slide_bounds(scaling=scaling)]
             else:
-                slide_level_size = slide_image.get_scaled_size(scaling)
-                _rois = parse_rois(rois, slide_level_size, scaling=slide_mpp / mpp if mpp else 1.0)
+                slide_level_size = slide_image.get_scaled_size(scaling, limit_bounds=False)
+                _rois = [((0, 0), slide_level_size)]
 
         grid_mpp = mpp if mpp is not None else slide_mpp
         grids = []
@@ -513,6 +544,7 @@ class TiledWsiDataset(BaseWsiDataset):
             crop=crop,
             mask=mask,
             mask_threshold=mask_threshold,
+            output_tile_size=output_tile_size,
             annotations=annotations,
             labels=labels,
             transform=transform,

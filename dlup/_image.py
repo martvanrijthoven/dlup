@@ -1,5 +1,4 @@
 # Copyright (c) dlup contributors
-
 """Whole slide image access objects.
 
 In this module we take care of abstracting the access to whole slide images.
@@ -19,6 +18,7 @@ import numpy as np
 import numpy.typing as npt
 import PIL
 import PIL.Image
+from PIL.ImageCms import ImageCmsProfile
 
 from dlup import UnsupportedSlideError
 from dlup._region import BoundaryMode, RegionView
@@ -79,6 +79,42 @@ def _clip2size(
     return np.clip(a, (0, 0), size)
 
 
+def _check_size_and_location(
+    size: npt.NDArray[np.int_ | np.float_],
+    location: npt.NDArray[np.int_ | np.float_],
+    level_size: npt.NDArray[np.int_],
+) -> None:
+    """
+    Check if the size and location are within bounds for the given level size.
+
+    Parameters
+    ----------
+    size : npt.NDArray[np.int_ | np.float_]
+        The size of the region to extract.
+    location : npt.NDArray[np.int_ | np.float_]
+        The location of the region to extract.
+    level_size : npt.NDArray[np.int_]
+        The size of the level.
+
+    Raises
+    ------
+    ValueError
+        If the size is negative or if the location is outside the level boundaries.
+
+    Returns
+    -------
+    None
+    """
+    if (size < 0).any():
+        raise ValueError(f"Size values must be greater than zero. Got {size}")
+
+    if ((location < 0) | ((location + size) > level_size)).any():
+        raise ValueError(
+            f"Requested region is outside level boundaries. "
+            f"{location.tolist()} + {size.tolist()} (={(location + size).tolist()}) > {level_size.tolist()}."
+        )
+
+
 class SlideImage:
     """Utility class to simplify whole-slide pyramidal images management.
 
@@ -100,22 +136,53 @@ class SlideImage:
     >>> wsi = dlup.SlideImage.from_file_path('path/to/slide.svs')
     """
 
-    def __init__(self, wsi: AbstractSlideBackend, identifier: str | None = None, **kwargs: Any) -> None:
-        """Initialize a whole slide image and validate its properties."""
+    def __init__(
+        self,
+        wsi: AbstractSlideBackend,
+        identifier: str | None = None,
+        interpolator: Optional[Resampling] = Resampling.LANCZOS,
+        overwrite_mpp: Optional[tuple[float, float]] = None,
+        apply_color_profile: bool = False,
+    ) -> None:
+        """Initialize a whole slide image and validate its properties. This class allows to read whole-slide images
+        at any arbitrary resolution. This class can read images from any backend that implements the
+        AbstractSlideBackend interface.
+
+        Parameters
+        ----------
+        wsi : AbstractSlideBackend
+            The slide object.
+        identifier : str, optional
+            A user-defined identifier for the slide, used in e.g. exceptions.
+        interpolator : Resampling, optional
+            The interpolator to use when reading regions. For images typically LANCZOS is the best choice. Masks
+            can use NEAREST. If set to None, will use LANCZOS.
+        overwrite_mpp : tuple[float, float], optional
+            Overwrite the mpp of the slide. For instance, if the mpp is not available, or when sourcing from
+            and external database.
+        apply_color_profile : bool
+            Whether to apply the color profile to the output regions.
+
+        Raises
+        ------
+        UnsupportedSlideError
+            If the slide is not supported, or when the mpp is not valid (too anisotropic).
+
+        Returns
+        -------
+        None
+
+        """
         self._wsi = wsi
         self._identifier = identifier
 
-        if kwargs.get("interpolator", None) is not None:
-            interpolator = kwargs["interpolator"]
-            if isinstance(interpolator, Resampling):
-                interpolator = interpolator.name
-
-            self._interpolator = PIL.Image.Resampling[interpolator]
+        if interpolator is not None:
+            self._interpolator = PIL.Image.Resampling[interpolator.name]
         else:
             self._interpolator = PIL.Image.Resampling.LANCZOS
 
-        if kwargs.get("overwrite_mpp", None) is not None:
-            self._wsi.spacing = kwargs["overwrite_mpp"]
+        if overwrite_mpp is not None:
+            self._wsi.spacing = overwrite_mpp
 
         if self._wsi.spacing is None:
             raise UnsupportedSlideError(
@@ -124,11 +191,57 @@ class SlideImage:
             )
 
         check_if_mpp_is_valid(*self._wsi.spacing)
-        # self._avg_native_mpp = (float(self._wsi.spacing[0]) + float(self._wsi.spacing[1])) / 2
+        self._avg_native_mpp = (float(self._wsi.spacing[0]) + float(self._wsi.spacing[1])) / 2
 
     def close(self) -> None:
         """Close the underlying image."""
         self._wsi.close()
+
+    @property
+    def color_profile(self) -> ImageCmsProfile | None:
+        """Returns the ICC profile of the image.
+
+        Each image in the pyramid has the same ICC profile, but the associated images might have their own.
+        If you wish to apply the ICC profile (which is also available as a property in the region itself).
+
+        TODO
+        ----
+        The color profile is attached to each region, but in our approach it is possible that at some point the
+        color profile is dropped due to casting to numpy arrays. This is not a problem for the moment, but
+        it might be in the future.
+
+        You can use the profile as follows:
+
+        >>> import dlup
+        >>> from PIL import ImageCms
+        >>> wsi = dlup.SlideImage.from_file_path("path/to/slide.svs")
+        >>> region = wsi.read_region((0, 0), 1.0, (512, 512))
+        >>> to_profile = ImageCms.createProfile("sRGB")
+        >>> intent = ImageCms.getDefaultIntent(wsi.color_profile)
+        >>> transform = ImageCms.buildTransform(wsi.color_profile, to_profile, "RGBA", "RGBA", intent, 0)
+        >>> # Now you can apply the transform to the region (or any other PIL image)
+        >>> ImageCms.applyTransform(region, transform, True)
+
+        Returns
+        -------
+        ImageCmsProfile
+            The ICC profile of the image.
+        """
+        return getattr(self._wsi, "color_profile", None)
+
+    @property
+    def _color_transform(self) -> PIL.ImageCms.ImageCmsTransform | None:
+        if self.color_profile is None:
+            return None
+
+        if self.__color_transforms is None:
+            to_profile = PIL.ImageCms.createProfile("sRGB")
+            intent = PIL.ImageCms.getDefaultIntent(self.color_profile)
+            self.__color_transform = cast(
+                PIL.ImageCms.ImageCmsTransform,
+                PIL.ImageCms.buildTransform(self.color_profile, to_profile, "RGBA", "RGBA", intent, 0),
+            )
+        return self.__color_transform
 
     def __enter__(self) -> "SlideImage":
         return self
@@ -147,7 +260,7 @@ class SlideImage:
         cls: Type[_TSlideImage],
         wsi_file_path: PathLike,
         identifier: str | None = None,
-        backend: ImageBackend = ImageBackend.PYVIPS,
+        backend: ImageBackend = ImageBackend.OPENSLIDE,
         **kwargs: Any,
     ) -> _TSlideImage:
         wsi_file_path = pathlib.Path(wsi_file_path)
@@ -175,7 +288,7 @@ class SlideImage:
         A typical slide is made of several levels at different mpps.
         In normal cirmustances, it's not possible to retrieve an image of
         intermediate mpp between these levels. This method takes care of
-        sumbsampling the closest high resolution level to extract a target
+        subsampling the closest high resolution level to extract a target
         region via interpolation.
 
         Once the best layer is selected, a native resolution region
@@ -220,7 +333,7 @@ class SlideImage:
         resulting tile size of ``(tile_size, tile_size)`` with a scaling factor of 0.5, we can use:
         >>>  wsi.read_region(location=(coordinate_x, coordinate_y), scaling=0.5, size=(tile_size, tile_size))
         """
-        owsi = self._wsi
+        wsi = self._wsi
         location = np.asarray(location)
         size = np.asarray(size)
         level_size = np.array(self.get_scaled_size(scaling))
@@ -231,10 +344,10 @@ class SlideImage:
         if ((location < 0) | ((location + size) > level_size)).any():
             raise ValueError("Requested region is outside level boundaries.")
 
-        native_level = owsi.get_best_level_for_downsample(1 / scaling)
-        native_level_size = owsi.level_dimensions[native_level]
-        native_level_downsample = owsi.level_downsamples[native_level]
-        native_scaling = scaling * owsi.level_downsamples[native_level]
+        native_level = wsi.get_best_level_for_downsample(1 / scaling)
+        native_level_size = wsi.level_dimensions[native_level]
+        native_level_downsample = wsi.level_downsamples[native_level]
+        native_scaling = scaling * wsi.level_downsamples[native_level]
         native_location = location / native_scaling
         native_size = size / native_scaling
 
@@ -260,12 +373,18 @@ class SlideImage:
         # region.
         native_size_adapted = np.ceil(native_size_adapted).astype(int)
 
-        # We extract the region via openslide with the required extra border
-        region = owsi.read_region(
+        # We extract the region via the slide backend with the required extra border
+        region = wsi.read_region(
             (level_zero_location_adapted[0], level_zero_location_adapted[1]),
             native_level,
             (native_size_adapted[0], native_size_adapted[1]),
         )
+
+        if self._apply_color_profile and self.color_profile is not None:
+            PIL.ImageCms.applyTransform(region, self._color_transform, True)
+            # Remove the ICC profile from the region to make sure it's not applied twice by accident.
+            # Should always be available if a color profile is present.
+            del region.info["icc_profile"]
 
         # Within this region, there are a bunch of extra pixels, we interpolate to sample
         # the pixel in the right position to retain the right sample weight.
@@ -282,18 +401,36 @@ class SlideImage:
         )
         box = cast(tuple[float, float, float, float], box)
         size = cast(tuple[int, int], size)
-        return region.resize(size, resample=self._interpolator, box=box)
+        region = region.resize(size, resample=self._interpolator, box=box)
+        return region
 
-    def get_scaled_size(self, scaling: GenericNumber) -> tuple[int, int]:
-        """Compute slide image size at specific scaling."""
-        size = np.array(self.size) * scaling
-        return cast(tuple[int, int], tuple(size.astype(int)))
+    def get_scaled_size(self, scaling: GenericNumber, limit_bounds: Optional[bool] = False) -> tuple[int, int]:
+        """Compute slide image size at specific scaling.
+
+        Parameters
+        -----------
+        scaling: GenericNumber
+            The factor by which the image needs to be scaled.
+
+        limit_bounds: Optional[bool]
+            If True, the scaled size will be calculated using the slide bounds of the whole slide image.
+            This is generally the specific area within a whole slide image where we can find the tissue specimen.
+
+        Returns
+        -------
+        size: tuple[int, int]
+            The scaled size of the image.
+        """
+        if limit_bounds:
+            _, bounded_size = self.slide_bounds
+            size = int(bounded_size[0] * scaling), int(bounded_size[1] * scaling)
+        else:
+            size = int(self.size[0] * scaling), int(self.size[1] * scaling)
+        return size
 
     def get_mpp(self, scaling: float) -> float:
         """Returns the respective mpp from the scaling."""
-        if self._wsi.spacing is None:
-            return 1.0
-        return self._wsi.spacing[0] / scaling
+        return self._avg_native_mpp / scaling
 
     def get_scaling(self, mpp: float | None) -> float:
         """Inverse of get_mpp()."""
@@ -369,6 +506,25 @@ class SlideImage:
         These bounds are in the format (x, y), (width, height), and are defined at level 0 of the image.
         """
         return self._wsi.slide_bounds
+
+    def get_scaled_slide_bounds(self, scaling: float) -> tuple[tuple[int, int], tuple[int, int]]:
+        """Returns the bounds of the slide at a specific scaling level. This takes the slide bounds into account
+        and scales them to the appropriate scaling level.
+
+        Parameters
+        ----------
+        scaling : float
+            The scaling level to use.
+
+        Returns
+        -------
+        tuple[tuple[int, int], tuple[int, int]]
+            The slide bounds at the given scaling level.
+        """
+        offset, size = self.slide_bounds
+        offset = (int(scaling * offset[0]), int(scaling * offset[1]))
+        size = (int(scaling * size[0]), int(scaling * size[1]))
+        return offset, size
 
     def __repr__(self) -> str:
         """Returns the SlideImage representation and some of its properties."""

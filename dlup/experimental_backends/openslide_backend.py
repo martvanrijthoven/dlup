@@ -2,15 +2,52 @@
 # Copyright (c) dlup contributors
 from __future__ import annotations
 
+import warnings
+from distutils.version import LooseVersion
 from typing import cast
 
 import numpy as np
 import openslide
 import PIL.Image
+from PIL.ImageCms import ImageCmsProfile
 
 from dlup.backends.common import AbstractSlideBackend
 from dlup.types import PathLike
 from dlup.utils.image import check_if_mpp_is_valid
+
+TIFF_PROPERTY_NAME_RESOLUTION_UNIT = "tiff.ResolutionUnit"
+TIFF_PROPERTY_NAME_X_RESOLUTION = "tiff.XResolution"
+TIFF_PROPERTY_NAME_Y_RESOLUTION = "tiff.YResolution"
+
+
+def _get_mpp_from_tiff(properties: dict[str, str]) -> tuple[float, float] | None:
+    """Get mpp values from the TIFF tags as parsed by openslide.
+    This only works for openslide < 4.0.0, as newer openslide versions automatically parse this.
+
+    Parameters
+    ----------
+    properties : dict[str, str]
+        The properties as parsed by openslide.
+
+    Returns
+    -------
+    tuple[float, float] or None
+        The mpp values if they are present in the TIFF tags, otherwise None.
+    """
+    # It is possible we now have a TIFF file with the mpp information in the TIFF tags.
+    if LooseVersion(openslide.__library_version__) < LooseVersion("4.0.0"):
+        if properties[openslide.PROPERTY_NAME_VENDOR] == "generic-tiff":
+            # Check if the TIFF tags are present
+            resolution_unit = properties.get(TIFF_PROPERTY_NAME_RESOLUTION_UNIT, None)
+            x_resolution = float(properties.get(TIFF_PROPERTY_NAME_X_RESOLUTION, 0))
+            y_resolution = float(properties.get(TIFF_PROPERTY_NAME_Y_RESOLUTION, 0))
+
+            if x_resolution > 0 and y_resolution > 0:
+                unit_dict = {"cm": 10000, "centimeter": 10000}
+                mpp_x = unit_dict[resolution_unit] / x_resolution
+                mpp_y = unit_dict[resolution_unit] / y_resolution
+                return mpp_x, mpp_y
+    return None
 
 
 def open_slide(filename: PathLike) -> "OpenSlideSlide":
@@ -38,6 +75,7 @@ class OpenSlideSlide(openslide.OpenSlide, AbstractSlideBackend):
             Path to image.
         """
         super().__init__(str(filename))
+        self._spacings = None
 
         try:
             mpp_x = float(self.properties[openslide.PROPERTY_NAME_MPP_X])
@@ -45,7 +83,10 @@ class OpenSlideSlide(openslide.OpenSlide, AbstractSlideBackend):
             self.spacing = (mpp_x, mpp_y)
 
         except KeyError:
-            pass
+            # It is possible we now have a TIFF file with the mpp information in the TIFF tags.
+            spacing = _get_mpp_from_tiff(dict(self.properties))
+            if spacing:
+                self.spacing = spacing
 
     @property
     def spacing(self) -> tuple[float, float] | None:
@@ -70,6 +111,26 @@ class OpenSlideSlide(openslide.OpenSlide, AbstractSlideBackend):
         if value is not None:
             return int(value)
         return value
+
+    @property
+    def color_profile(self) -> ImageCmsProfile | None:
+        """
+        Returns the color profile of the image if available. Otherwise returns None.
+
+        Returns
+        -------
+        ImageCmsProfile, optional
+            The color profile of the image.
+        """
+        if LooseVersion(openslide.__library_version__) < LooseVersion("4.0.0"):
+            warnings.warn(
+                "Color profile support is only available for openslide >= 4.0.0. "
+                f"You have version {openslide.__library_version__}. "
+                "Please update your openslide installation if you want to use this feature (recommended)."
+            )
+            return None
+
+        return super().color_profile
 
     @property
     def vendor(self) -> str:

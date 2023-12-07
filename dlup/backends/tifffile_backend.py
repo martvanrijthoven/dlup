@@ -47,9 +47,9 @@ class TifffileSlide(AbstractSlideBackend):
         for idx, page in enumerate(self._image.pages):
             # Remove channel dimension and swap rows and columns
             if len(page.shape) == 3:
-                self._shapes.append((page.shape[1], page.shape[2]))
+                self._shapes.append((page.shape[1], page.shape[0]))
             else:
-                self._shapes.append((page.shape[0], page.shape[1]))
+                self._shapes.append((page.shape[1], page.shape[0]))
 
             # TODO: The order of the x and y tag need to be verified
             x_res = page.tags["XResolution"].value  # type: ignore
@@ -60,7 +60,7 @@ class TifffileSlide(AbstractSlideBackend):
 
             mpp_x = unit_dict[unit] / x_res
             mpp_y = unit_dict[unit] / y_res
-            self._spacings.append((mpp_y, mpp_x))
+            self._spacings.append((mpp_x, mpp_y))
 
             if idx >= 1:
                 downsample = mpp_x / self._spacings[0][0]
